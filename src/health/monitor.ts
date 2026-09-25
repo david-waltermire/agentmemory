@@ -37,18 +37,13 @@ export function registerHealthMonitor(
     const eventLoopLagMs = performance.now() - startMark;
 
     let workers: HealthSnapshot["workers"] = [];
-    // Opt-in: on engine 0.22.1 each engine::workers::list call dropped this
-    // worker's connection and unregistered every route, and this monitor
-    // runs every 30 s. The list is informational only.
-    if (process.env.AGENTMEMORY_HEALTH_LIST_WORKERS === "true") {
-      try {
-        const result = await sdk.trigger<
-          unknown,
-          { workers?: HealthSnapshot["workers"] }
-        >({ function_id: "engine::workers::list", payload: {} });
-        if (result?.workers) workers = result.workers;
-      } catch {}
-    }
+    try {
+      const result = await sdk.trigger<
+        unknown,
+        { workers?: HealthSnapshot["workers"] }
+      >({ function_id: "engine::workers::list", payload: {} });
+      if (result?.workers) workers = result.workers;
+    } catch {}
 
     const KV_PROBE_TIMEOUT = 5000;
     let kvConnectivity: { status: string; latencyMs?: number; error?: string };
