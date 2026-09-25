@@ -1722,8 +1722,8 @@
       lesson: { path: 'lessons', key: 'lessons' },
       action: { path: 'actions', key: 'actions' },
       crystal: { path: 'crystals', key: 'crystals' },
-      semantic: { path: 'semantic', key: 'facts', fallbackKey: 'semantic' },
-      procedural: { path: 'procedural', key: 'procedures', fallbackKey: 'procedural' },
+      semantic: { path: 'semantic?limit=100', key: 'facts', fallbackKey: 'semantic' },
+      procedural: { path: 'procedural?limit=100', key: 'procedures', fallbackKey: 'procedural' },
       audit: { path: 'audit?limit=100', key: 'entries' }
     };
     var bootGateOpen = null;
