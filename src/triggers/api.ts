@@ -2017,6 +2017,34 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/reset", http_method: "POST" },
   });
 
+  // Trims graph provenance written before the per-record cap, walking the
+  // small name and edge-key indexes instead of listing the graph.
+  sdk.registerFunction("api::graph-compact",
+    async (req: HttpRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      try {
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const result = await sdk.trigger({
+          function_id: "mem::graph-compact",
+          payload: {
+            scope: body.scope,
+            offset: body.offset,
+            limit: body.limit,
+          },
+        });
+        return { status_code: 200, body: result };
+      } catch {
+        return graphDisabledResponse();
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-compact",
+    config: { api_path: "/agentmemory/graph/compact", http_method: "POST" },
+  });
+
   sdk.registerFunction("api::graph-extract",
     async (req: HttpRequest<{ observations: unknown[] }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);

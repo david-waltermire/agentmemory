@@ -279,35 +279,47 @@ function snapshotPushEdgeIfBothInTop(
   }
 }
 
+// Provenance is bounded. Every merge used to union the whole batch's
+// observation ids into every node and edge it touched, which grew hot
+// nodes without limit: on one store 98% of the graph's bytes were these
+// ids, and every kv.list traversal carried them. Retrieval reads at most
+// 20 results, so a record never needs more than its newest sources.
+export const MAX_GRAPH_SOURCE_OBSERVATIONS = 32;
+
+// Union in arrival order, with a re-seen id moved to the newest end, then
+// keep the newest MAX_GRAPH_SOURCE_OBSERVATIONS.
+export function boundSources(existing: string[], incoming: string[]): string[] {
+  const merged = new Set(existing);
+  for (const id of incoming) {
+    merged.delete(id);
+    merged.add(id);
+  }
+  return [...merged].slice(-MAX_GRAPH_SOURCE_OBSERVATIONS);
+}
+
 function mergeNode(
   existing: GraphNode,
   incoming: GraphNode,
-  obsIds: string[],
   capturedAt: string,
 ): GraphNode {
   return {
     ...existing,
-    sourceObservationIds: [
-      ...new Set([
-        ...existing.sourceObservationIds,
-        ...incoming.sourceObservationIds,
-        ...obsIds,
-      ]),
-    ],
+    sourceObservationIds: boundSources(
+      existing.sourceObservationIds ?? [],
+      incoming.sourceObservationIds ?? [],
+    ),
     properties: { ...existing.properties, ...incoming.properties },
     updatedAt: capturedAt,
   };
 }
 
-function mergeEdge(
-  existing: GraphEdge,
-  obsIds: string[],
-): GraphEdge {
+function mergeEdge(existing: GraphEdge, incoming: GraphEdge): GraphEdge {
   return {
     ...existing,
-    sourceObservationIds: [
-      ...new Set([...existing.sourceObservationIds, ...obsIds]),
-    ],
+    sourceObservationIds: boundSources(
+      existing.sourceObservationIds ?? [],
+      incoming.sourceObservationIds ?? [],
+    ),
   };
 }
 
@@ -559,7 +571,6 @@ export async function persistGraphDelta(
   kv: StateKV,
   nodes: GraphNode[],
   edges: GraphEdge[],
-  obsIds: string[],
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
   return withKeyedLock("graph:persist", async () => {
     const snap = (await readSnapshot(kv)) ?? emptySnapshot();
@@ -600,7 +611,7 @@ export async function persistGraphDelta(
 
       if (existing) {
         idRemap.set(node.id, existing.id);
-        const merged = mergeNode(existing, node, obsIds, capturedAt);
+        const merged = mergeNode(existing, node, capturedAt);
         await kv.set(KV.graphNodes, existing.id, merged);
         // Update topNodes entry if present so a stale clone isn't
         // returned from the snapshot fast path.
@@ -610,6 +621,7 @@ export async function persistGraphDelta(
           snapMutated = true;
         }
       } else {
+        node.sourceObservationIds = boundSources([], node.sourceObservationIds ?? []);
         await kv.set(KV.graphNodes, node.id, node);
         await kv.set(KV.graphNameIndex, indexKey, node.id);
         await kv.set(KV.graphNodeDegree, node.id, 0);
@@ -650,7 +662,7 @@ export async function persistGraphDelta(
       }
 
       if (existing) {
-        const merged = mergeEdge(existing, obsIds);
+        const merged = mergeEdge(existing, edge);
         await kv.set(KV.graphEdges, existing.id, merged);
         // Replace cached topEdges entry too if present.
         const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
@@ -659,6 +671,7 @@ export async function persistGraphDelta(
           snapMutated = true;
         }
       } else {
+        edge.sourceObservationIds = boundSources([], edge.sourceObservationIds ?? []);
         await kv.set(KV.graphEdges, edge.id, edge);
         await kv.set(KV.graphEdgeKey, eKey, edge.id);
         snap.stats.totalEdges += 1;
@@ -686,6 +699,133 @@ export async function persistGraphDelta(
 
     return { newNodeCount, newEdgeCount };
   });
+}
+
+export interface GraphCompactResult {
+  nodesScanned: number;
+  nodesTrimmed: number;
+  edgesScanned: number;
+  edgesTrimmed: number;
+  idsRemoved: number;
+  snapshotTrimmed: boolean;
+  // Records in the sliced index, and where the next slice starts; null
+  // when this call reached the end. A full run always ends with null.
+  total?: number;
+  nextOffset: number | null;
+}
+
+export type GraphCompactScope = "nodes" | "edges" | "snapshot";
+
+export interface GraphCompactOptions {
+  scope?: GraphCompactScope;
+  offset?: number;
+  limit?: number;
+}
+
+const COMPACT_SCOPES: readonly GraphCompactScope[] = ["nodes", "edges", "snapshot"];
+
+// Trims provenance written before the cap existed. Records are reached
+// through the name and edge-key indexes, whose values are short ids, and
+// then read and written one key at a time. The nodes and edges scopes are
+// never listed: that payload is what drops the worker on a large store.
+// A record missing from both indexes is not reached; it is also never
+// merged again, so it cannot grow.
+//
+// With no options it does everything in one call. With a scope it does one
+// slice, so each invocation stays short enough to finish between worker
+// reconnects; the caller walks nextOffset until it is null. Re-running any
+// slice is safe because trimmed records are skipped.
+export async function compactGraphProvenance(
+  kv: StateKV,
+  opts: GraphCompactOptions = {},
+): Promise<GraphCompactResult> {
+  const { scope } = opts;
+  if (scope !== undefined && !COMPACT_SCOPES.includes(scope)) {
+    throw new Error(`unknown compact scope: ${String(scope)}`);
+  }
+  const offset = opts.offset ?? 0;
+  const limit = opts.limit ?? Number.POSITIVE_INFINITY;
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new Error(`compact offset must be a non-negative integer: ${String(opts.offset)}`);
+  }
+  if (!(limit === Number.POSITIVE_INFINITY || (Number.isInteger(limit) && limit > 0))) {
+    throw new Error(`compact limit must be a positive integer: ${String(opts.limit)}`);
+  }
+
+  const result: GraphCompactResult = {
+    nodesScanned: 0,
+    nodesTrimmed: 0,
+    edgesScanned: 0,
+    edgesTrimmed: 0,
+    idsRemoved: 0,
+    snapshotTrimmed: false,
+    nextOffset: null,
+  };
+
+  const trimScope = async <R extends { sourceObservationIds: string[] }>(
+    indexScope: string,
+    recordScope: string,
+  ): Promise<{ scanned: number; trimmed: number }> => {
+    const allIds = [...new Set(await kv.list<string>(indexScope))].filter(
+      (id): id is string => typeof id === "string",
+    );
+    const end = Math.min(allIds.length, offset + limit);
+    result.total = allIds.length;
+    result.nextOffset = end < allIds.length ? end : null;
+    let scanned = 0;
+    let trimmed = 0;
+    for (const id of allIds.slice(offset, end)) {
+      await withKeyedLock("graph:persist", async () => {
+        const record = await kv.get<R>(recordScope, id);
+        if (!record) return;
+        scanned += 1;
+        const sources = record.sourceObservationIds ?? [];
+        if (sources.length <= MAX_GRAPH_SOURCE_OBSERVATIONS) return;
+        const bounded = boundSources([], sources);
+        result.idsRemoved += sources.length - bounded.length;
+        await kv.set(recordScope, id, { ...record, sourceObservationIds: bounded });
+        trimmed += 1;
+      });
+    }
+    return { scanned, trimmed };
+  };
+
+  const trimSnapshot = () =>
+    withKeyedLock("graph:persist", async () => {
+      const snap = await readSnapshot(kv);
+      if (!snap) return;
+      const trimList = <R extends { sourceObservationIds: string[] }>(list: R[]) =>
+        list.map((r) => {
+          const sources = r.sourceObservationIds ?? [];
+          if (sources.length <= MAX_GRAPH_SOURCE_OBSERVATIONS) return r;
+          result.snapshotTrimmed = true;
+          return { ...r, sourceObservationIds: boundSources([], sources) };
+        });
+      const topNodes = trimList(snap.topNodes);
+      const topEdges = trimList(snap.topEdges);
+      if (result.snapshotTrimmed) {
+        await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, { ...snap, topNodes, topEdges });
+      }
+    });
+
+  if (scope === undefined || scope === "nodes") {
+    const n = await trimScope<GraphNode>(KV.graphNameIndex, KV.graphNodes);
+    result.nodesScanned = n.scanned;
+    result.nodesTrimmed = n.trimmed;
+  }
+  if (scope === undefined || scope === "edges") {
+    const e = await trimScope<GraphEdge>(KV.graphEdgeKey, KV.graphEdges);
+    result.edgesScanned = e.scanned;
+    result.edgesTrimmed = e.trimmed;
+  }
+  if (scope === undefined || scope === "snapshot") {
+    await trimSnapshot();
+  }
+  if (scope === undefined) {
+    delete result.total;
+    result.nextOffset = null;
+  }
+  return result;
 }
 
 export function registerGraphFunction(
@@ -751,7 +891,6 @@ export function registerGraphFunction(
           kv,
           nodes,
           edges,
-          obsIds,
         );
 
         await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {
@@ -1135,6 +1274,20 @@ export function registerGraphFunction(
   // read by any post-#816 code path. Cleanup is deferred to a future
   // chunked-vacuum job; #816's broken vacuum-via-list strategy is
   // what we are leaving behind here.
+  sdk.registerFunction("mem::graph-compact", async (data?: GraphCompactOptions) => {
+    const started = Date.now();
+    try {
+      const result = await compactGraphProvenance(kv, data ?? {});
+      const tookMs = Date.now() - started;
+      logger.info("Graph provenance compacted", { ...result, tookMs });
+      return { success: true, ...result, tookMs };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error("Graph provenance compaction failed", { error: msg });
+      return { success: false, error: msg };
+    }
+  });
+
   sdk.registerFunction("mem::graph-reset", async () => {
     const started = Date.now();
     // Stamp resetAt=now on the empty snapshot. Future
