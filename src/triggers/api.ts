@@ -42,6 +42,35 @@ function parseOptionalInt(raw: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+const LIST_PAGE_DEFAULT = 50;
+const LIST_PAGE_MAX = 500;
+
+// One page of a scope plus its total. Whole-scope responses crossed the
+// engine's 16 MiB frame limit and dropped the worker, so list endpoints
+// page by default and refuse a page that would still be too large.
+function listPage<T>(
+  all: T[],
+  req: HttpRequest,
+  key: string,
+): Response {
+  const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
+  const rawOffset = parseOptionalInt(req.query_params?.["offset"]);
+  const limit =
+    rawLimit === undefined || rawLimit < 1
+      ? LIST_PAGE_DEFAULT
+      : Math.min(rawLimit, LIST_PAGE_MAX);
+  const offset = rawOffset === undefined || rawOffset < 0 ? 0 : rawOffset;
+  const body = {
+    [key]: all.slice(offset, offset + limit),
+    total: all.length,
+    limit,
+    offset,
+  };
+  const oversized = checkPayloadFrameSize(body, "request a smaller ?limit");
+  if (oversized) return { status_code: 413, body: oversized };
+  return { status_code: 200, body };
+}
+
 function checkAuth(
   req: HttpRequest,
   secret: string | undefined,
@@ -2155,7 +2184,7 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const semantic = await kv.list<import("../types.js").SemanticMemory>(KV.semantic);
-      return { status_code: 200, body: { semantic } };
+      return listPage(semantic, req, "semantic");
     },
   );
   sdk.registerTrigger({
@@ -2169,7 +2198,7 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
-      return { status_code: 200, body: { procedural } };
+      return listPage(procedural, req, "procedural");
     },
   );
   sdk.registerTrigger({
