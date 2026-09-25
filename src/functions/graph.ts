@@ -715,7 +715,21 @@ export interface GraphCompactResult {
   edgesTrimmed: number;
   idsRemoved: number;
   snapshotTrimmed: boolean;
+  // Records in the sliced index, and where the next slice starts; null
+  // when this call reached the end. A full run always ends with null.
+  total?: number;
+  nextOffset: number | null;
 }
+
+export type GraphCompactScope = "nodes" | "edges" | "snapshot";
+
+export interface GraphCompactOptions {
+  scope?: GraphCompactScope;
+  offset?: number;
+  limit?: number;
+}
+
+const COMPACT_SCOPES: readonly GraphCompactScope[] = ["nodes", "edges", "snapshot"];
 
 // Trims provenance written before the cap existed. Records are reached
 // through the name and edge-key indexes, whose values are short ids, and
@@ -723,9 +737,28 @@ export interface GraphCompactResult {
 // never listed: that payload is what drops the worker on a large store.
 // A record missing from both indexes is not reached; it is also never
 // merged again, so it cannot grow.
+//
+// With no options it does everything in one call. With a scope it does one
+// slice, so each invocation stays short enough to finish between worker
+// reconnects; the caller walks nextOffset until it is null. Re-running any
+// slice is safe because trimmed records are skipped.
 export async function compactGraphProvenance(
   kv: StateKV,
+  opts: GraphCompactOptions = {},
 ): Promise<GraphCompactResult> {
+  const { scope } = opts;
+  if (scope !== undefined && !COMPACT_SCOPES.includes(scope)) {
+    throw new Error(`unknown compact scope: ${String(scope)}`);
+  }
+  const offset = opts.offset ?? 0;
+  const limit = opts.limit ?? Number.POSITIVE_INFINITY;
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new Error(`compact offset must be a non-negative integer: ${String(opts.offset)}`);
+  }
+  if (!(limit === Number.POSITIVE_INFINITY || (Number.isInteger(limit) && limit > 0))) {
+    throw new Error(`compact limit must be a positive integer: ${String(opts.limit)}`);
+  }
+
   const result: GraphCompactResult = {
     nodesScanned: 0,
     nodesTrimmed: 0,
@@ -733,17 +766,22 @@ export async function compactGraphProvenance(
     edgesTrimmed: 0,
     idsRemoved: 0,
     snapshotTrimmed: false,
+    nextOffset: null,
   };
 
   const trimScope = async <R extends { sourceObservationIds: string[] }>(
     indexScope: string,
     recordScope: string,
   ): Promise<{ scanned: number; trimmed: number }> => {
-    const recordIds = new Set(await kv.list<string>(indexScope));
+    const allIds = [...new Set(await kv.list<string>(indexScope))].filter(
+      (id): id is string => typeof id === "string",
+    );
+    const end = Math.min(allIds.length, offset + limit);
+    result.total = allIds.length;
+    result.nextOffset = end < allIds.length ? end : null;
     let scanned = 0;
     let trimmed = 0;
-    for (const id of recordIds) {
-      if (typeof id !== "string") continue;
+    for (const id of allIds.slice(offset, end)) {
       await withKeyedLock(GRAPH_WRITE_LOCK, async () => {
         const record = await kv.get<R>(recordScope, id);
         if (!record) return;
@@ -759,30 +797,41 @@ export async function compactGraphProvenance(
     return { scanned, trimmed };
   };
 
-  const n = await trimScope<GraphNode>(KV.graphNameIndex, KV.graphNodes);
-  result.nodesScanned = n.scanned;
-  result.nodesTrimmed = n.trimmed;
-  const e = await trimScope<GraphEdge>(KV.graphEdgeKey, KV.graphEdges);
-  result.edgesScanned = e.scanned;
-  result.edgesTrimmed = e.trimmed;
+  const trimSnapshot = () =>
+    withKeyedLock(GRAPH_WRITE_LOCK, async () => {
+      const snap = await readSnapshot(kv);
+      if (!snap) return;
+      const trimList = <R extends { sourceObservationIds: string[] }>(list: R[]) =>
+        list.map((r) => {
+          const sources = r.sourceObservationIds ?? [];
+          if (sources.length <= MAX_GRAPH_SOURCE_OBSERVATIONS) return r;
+          result.snapshotTrimmed = true;
+          return { ...r, sourceObservationIds: boundSources([], sources) };
+        });
+      const topNodes = trimList(snap.topNodes);
+      const topEdges = trimList(snap.topEdges);
+      if (result.snapshotTrimmed) {
+        await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, { ...snap, topNodes, topEdges });
+      }
+    });
 
-  await withKeyedLock(GRAPH_WRITE_LOCK, async () => {
-    const snap = await readSnapshot(kv);
-    if (!snap) return;
-    const trimList = <R extends { sourceObservationIds: string[] }>(list: R[]) =>
-      list.map((r) => {
-        const sources = r.sourceObservationIds ?? [];
-        if (sources.length <= MAX_GRAPH_SOURCE_OBSERVATIONS) return r;
-        result.snapshotTrimmed = true;
-        return { ...r, sourceObservationIds: boundSources([], sources) };
-      });
-    const topNodes = trimList(snap.topNodes);
-    const topEdges = trimList(snap.topEdges);
-    if (result.snapshotTrimmed) {
-      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, { ...snap, topNodes, topEdges });
-    }
-  });
-
+  if (scope === undefined || scope === "nodes") {
+    const n = await trimScope<GraphNode>(KV.graphNameIndex, KV.graphNodes);
+    result.nodesScanned = n.scanned;
+    result.nodesTrimmed = n.trimmed;
+  }
+  if (scope === undefined || scope === "edges") {
+    const e = await trimScope<GraphEdge>(KV.graphEdgeKey, KV.graphEdges);
+    result.edgesScanned = e.scanned;
+    result.edgesTrimmed = e.trimmed;
+  }
+  if (scope === undefined || scope === "snapshot") {
+    await trimSnapshot();
+  }
+  if (scope === undefined) {
+    delete result.total;
+    result.nextOffset = null;
+  }
   return result;
 }
 
@@ -1228,10 +1277,10 @@ export function registerGraphFunction(
   // read by any post-#816 code path. Cleanup is deferred to a future
   // chunked-vacuum job; #816's broken vacuum-via-list strategy is
   // what we are leaving behind here.
-  sdk.registerFunction("mem::graph-compact", async () => {
+  sdk.registerFunction("mem::graph-compact", async (data?: GraphCompactOptions) => {
     const started = Date.now();
     try {
-      const result = await compactGraphProvenance(kv);
+      const result = await compactGraphProvenance(kv, data ?? {});
       const tookMs = Date.now() - started;
       logger.info("Graph provenance compacted", { ...result, tookMs });
       return { success: true, ...result, tookMs };

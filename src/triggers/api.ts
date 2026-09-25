@@ -1683,9 +1683,14 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       try {
+        const body = (req.body ?? {}) as Record<string, unknown>;
         const result = await sdk.trigger({
           function_id: "mem::graph-compact",
-          payload: {},
+          payload: {
+            scope: body.scope,
+            offset: body.offset,
+            limit: body.limit,
+          },
         });
         return { status_code: 200, body: result };
       } catch {

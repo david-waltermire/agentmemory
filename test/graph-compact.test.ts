@@ -234,3 +234,88 @@ describe("api::graph-compact endpoint", () => {
     );
   });
 });
+
+describe("chunked compaction", () => {
+  it("processes one slice of a scope and returns where the next slice starts", async () => {
+    const kv = mockKV();
+    for (let i = 0; i < 5; i++) await seedNode(kv, `gn_${i}`, `n${i}`, ids(`obs${i}`, 50));
+    const first = await compactGraphProvenance(kv as never, { scope: "nodes", offset: 0, limit: 2 });
+    expect(first).toMatchObject({ nodesScanned: 2, nodesTrimmed: 2, total: 5, nextOffset: 2 });
+    const trimmed = [];
+    for (let i = 0; i < 5; i++) trimmed.push((await node(kv, `gn_${i}`))!.sourceObservationIds.length);
+    expect(trimmed).toEqual([MAX_GRAPH_SOURCE_OBSERVATIONS, MAX_GRAPH_SOURCE_OBSERVATIONS, 50, 50, 50]);
+  });
+
+  it("walking every slice trims everything and ends with nextOffset null", async () => {
+    const kv = mockKV();
+    for (let i = 0; i < 5; i++) await seedNode(kv, `gn_${i}`, `n${i}`, ids(`obs${i}`, 50));
+    let offset: number | null = 0;
+    let calls = 0;
+    while (offset !== null && calls < 10) {
+      const r = await compactGraphProvenance(kv as never, { scope: "nodes", offset, limit: 2 });
+      offset = r.nextOffset === undefined ? -1 : r.nextOffset;
+      calls += 1;
+    }
+    expect(calls).toBe(3);
+    for (let i = 0; i < 5; i++) {
+      expect((await node(kv, `gn_${i}`))!.sourceObservationIds.length).toBe(MAX_GRAPH_SOURCE_OBSERVATIONS);
+    }
+  });
+
+  it("an edges slice touches edges only", async () => {
+    const kv = mockKV();
+    const n = await seedNode(kv, "gn_1", "hub", ids("obs", 50));
+    await seedEdge(kv, "ge_1", "gn_1", "gn_2", ids("obs", 50));
+    await kv.set("mem:graph:snapshot", "current", {
+      version: 1, dirty: false, topNodes: [n], topEdges: [], topDegrees: {},
+      stats: { totalNodes: 1, totalEdges: 1, nodesByType: {}, edgesByType: {} },
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    });
+    const r = await compactGraphProvenance(kv as never, { scope: "edges", offset: 0, limit: 10 });
+    expect(r).toMatchObject({ edgesTrimmed: 1, nodesScanned: 0, nextOffset: null, snapshotTrimmed: false });
+    expect((await node(kv, "gn_1"))!.sourceObservationIds.length).toBe(50);
+    const snap = (await kv.get<{ topNodes: GraphNode[] }>("mem:graph:snapshot", "current"))!;
+    expect(snap.topNodes[0]!.sourceObservationIds.length).toBe(50);
+  });
+
+  it("the snapshot scope trims only the snapshot", async () => {
+    const kv = mockKV();
+    const n = await seedNode(kv, "gn_1", "hub", ids("obs", 50));
+    await kv.set("mem:graph:snapshot", "current", {
+      version: 1, dirty: false, topNodes: [n], topEdges: [], topDegrees: {},
+      stats: { totalNodes: 1, totalEdges: 0, nodesByType: {}, edgesByType: {} },
+      updatedAt: "2026-09-01T00:00:00.000Z",
+    });
+    const r = await compactGraphProvenance(kv as never, { scope: "snapshot" });
+    expect(r).toMatchObject({ snapshotTrimmed: true, nodesScanned: 0, nextOffset: null });
+    expect((await node(kv, "gn_1"))!.sourceObservationIds.length).toBe(50);
+  });
+
+  it("an offset past the end scans nothing and ends", async () => {
+    const kv = mockKV();
+    await seedNode(kv, "gn_1", "hub", ids("obs", 50));
+    const r = await compactGraphProvenance(kv as never, { scope: "nodes", offset: 10, limit: 5 });
+    expect(r).toMatchObject({ nodesScanned: 0, total: 1, nextOffset: null });
+  });
+
+  it("rejects an unknown scope or a bad offset or limit", async () => {
+    const kv = mockKV();
+    await expect(compactGraphProvenance(kv as never, { scope: "bogus" as never })).rejects.toThrow(/scope/);
+    await expect(compactGraphProvenance(kv as never, { scope: "nodes", offset: -1, limit: 5 })).rejects.toThrow(/offset/);
+    await expect(compactGraphProvenance(kv as never, { scope: "nodes", offset: 0, limit: 0 })).rejects.toThrow(/limit/);
+  });
+
+  it("mem::graph-compact passes the slice through", async () => {
+    const kv = mockKV();
+    for (let i = 0; i < 3; i++) await seedNode(kv, `gn_${i}`, `n${i}`, ids(`obs${i}`, 50));
+    const functions = new Map<string, Function>();
+    const sdk = {
+      registerFunction: (idOrOpts: string | { id: string }, handler: Function) =>
+        functions.set(typeof idOrOpts === "string" ? idOrOpts : idOrOpts.id, handler),
+      registerTrigger: () => {},
+    };
+    registerGraphFunction(sdk as never, kv as never, { name: "noop", compress: vi.fn(), summarize: vi.fn() } as never);
+    const r = await functions.get("mem::graph-compact")!({ scope: "nodes", offset: 0, limit: 1 });
+    expect(r).toMatchObject({ success: true, nodesScanned: 1, nextOffset: 1 });
+  });
+});
