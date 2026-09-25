@@ -225,6 +225,9 @@ export interface HealthSnapshot {
   memory: {
     heapUsed: number;
     heapTotal: number;
+    // V8 heap_size_limit (--max-old-space-size). heapTotal is only what V8
+    // has allocated so far, so usage is judged against this when present.
+    heapLimit?: number;
     rss: number;
     external: number;
   };
