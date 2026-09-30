@@ -524,6 +524,18 @@ describe("api::graph-compact responses", () => {
     expect((await post({})).status_code).toBe(200);
   });
 
+  it("returns 500 when compaction reports its own failure, without leaking the error", async () => {
+    // mem::graph-compact catches a storage error and returns success:false,
+    // so sdk.trigger resolves; the route must not answer 200.
+    const post = await route(async () => ({
+      success: false,
+      error: "kv write failed: disk full",
+    }));
+    const r = await post({ scope: "nodes", offset: 0, limit: 10 });
+    expect(r.status_code).toBe(500);
+    expect(r.body).toEqual({ error: "Graph compaction failed" });
+  });
+
   it("returns 504 when the invocation times out", async () => {
     const { InvocationError } = await import("iii-sdk");
     const post = await route(async () => {

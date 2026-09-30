@@ -2041,6 +2041,11 @@ export function registerApiTriggers(
           function_id: "mem::graph-compact",
           payload: { scope, offset, limit },
         });
+        // Input was validated above, so success:false here is an operational
+        // failure (mem::graph-compact logs the detail). Do not answer 200.
+        if ((result as { success?: boolean } | null)?.success === false) {
+          return { status_code: 500, body: { error: "Graph compaction failed" } };
+        }
         return { status_code: 200, body: result };
       } catch (err) {
         // Compaction is registered whether or not graph extraction is on, so
