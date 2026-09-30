@@ -1,4 +1,4 @@
-import { TriggerAction, type IIIClient } from "iii-sdk";
+import { InvocationError, TriggerAction, type IIIClient } from "iii-sdk";
 import type { HttpRequest } from "@iii-dev/helpers/http";
 import { randomBytes } from "node:crypto";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary, HealthSnapshot, AuditQueryResult, AuditMigrationState } from "../types.js";
@@ -2023,19 +2023,35 @@ export function registerApiTriggers(
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      // Validate here: mem::graph-compact reports bad input as success:false,
+      // which would reach the caller as HTTP 200. JSON numbers only.
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const { scope, offset, limit } = body;
+      if (scope !== undefined && scope !== "nodes" && scope !== "edges" && scope !== "snapshot") {
+        return { status_code: 400, body: { error: "scope must be nodes, edges or snapshot" } };
+      }
+      if (offset !== undefined && !(Number.isInteger(offset) && (offset as number) >= 0)) {
+        return { status_code: 400, body: { error: "offset must be a non-negative integer" } };
+      }
+      if (limit !== undefined && !(Number.isInteger(limit) && (limit as number) >= 1)) {
+        return { status_code: 400, body: { error: "limit must be a positive integer" } };
+      }
       try {
-        const body = (req.body ?? {}) as Record<string, unknown>;
         const result = await sdk.trigger({
           function_id: "mem::graph-compact",
-          payload: {
-            scope: body.scope,
-            offset: body.offset,
-            limit: body.limit,
-          },
+          payload: { scope, offset, limit },
         });
         return { status_code: 200, body: result };
-      } catch {
-        return graphDisabledResponse();
+      } catch (err) {
+        // Compaction is registered whether or not graph extraction is on, so
+        // a failure here is never the graph-disabled case.
+        if (err instanceof InvocationError && err.code === "TIMEOUT") {
+          return {
+            status_code: 504,
+            body: { error: "Graph compaction timed out; pass scope, offset and limit to run it in slices" },
+          };
+        }
+        return { status_code: 500, body: { error: "Graph compaction failed" } };
       }
     },
   );

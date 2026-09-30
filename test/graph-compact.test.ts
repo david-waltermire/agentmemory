@@ -467,3 +467,78 @@ describe("chunked compaction", () => {
     expect(r).toMatchObject({ success: true, nodesScanned: 1, nextOffset: 1 });
   });
 });
+
+describe("api::graph-compact responses", () => {
+  async function route(
+    trigger: (req: {
+      function_id: string;
+      payload?: unknown;
+    }) => Promise<unknown>,
+  ) {
+    const { registerApiTriggers } = await import("../src/triggers/api.js");
+    const fns = new Map<string, Function>();
+    const sdk = {
+      registerFunction: (id: string, h: Function) => fns.set(id, h),
+      registerTrigger: () => {},
+      trigger,
+    };
+    registerApiTriggers(sdk as never, mockKV() as never);
+    return (body: unknown) =>
+      fns.get("api::graph-compact")!({ headers: {}, body }) as Promise<{
+        status_code: number;
+        body: Record<string, unknown>;
+      }>;
+  }
+
+  const ok = async () => ({ success: true, nodesTrimmed: 0 });
+
+  it("rejects invalid slice parameters with 400 before invoking compaction", async () => {
+    let calls = 0;
+    const post = await route(async () => {
+      calls += 1;
+      return ok();
+    });
+    for (const body of [
+      { scope: "bogus" },
+      { scope: "nodes", offset: -1 },
+      { scope: "nodes", offset: 1.5 },
+      { scope: "nodes", offset: "5" },
+      { scope: "nodes", limit: 0 },
+      { scope: "nodes", limit: "5" },
+    ]) {
+      const r = await post(body);
+      expect(r.status_code, JSON.stringify(body)).toBe(400);
+    }
+    expect(calls).toBe(0);
+  });
+
+  it("passes valid parameters through and returns 200", async () => {
+    let seen: unknown;
+    const post = await route(async (req) => {
+      seen = req.payload;
+      return ok();
+    });
+    const r = await post({ scope: "edges", offset: 0, limit: 1000 });
+    expect(r.status_code).toBe(200);
+    expect(seen).toEqual({ scope: "edges", offset: 0, limit: 1000 });
+    expect((await post({})).status_code).toBe(200);
+  });
+
+  it("returns 504 when the invocation times out", async () => {
+    const { InvocationError } = await import("iii-sdk");
+    const post = await route(async () => {
+      throw new InvocationError({ code: "TIMEOUT", message: "timed out" });
+    });
+    const r = await post({});
+    expect(r.status_code).toBe(504);
+  });
+
+  it("returns 500 for other failures, not the graph-disabled advice", async () => {
+    const post = await route(async () => {
+      throw new Error("worker gone");
+    });
+    const r = await post({});
+    expect(r.status_code).toBe(500);
+    expect(JSON.stringify(r.body)).not.toMatch(/GRAPH_EXTRACTION_ENABLED/);
+  });
+});
