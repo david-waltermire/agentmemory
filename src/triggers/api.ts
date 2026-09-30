@@ -68,30 +68,18 @@ function parseOptionalInt(raw: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+// Default page for list endpoints whose scope can outgrow the frame limit.
 const LIST_PAGE_DEFAULT = 50;
-const LIST_PAGE_MAX = 500;
 
-// One page of a scope plus its total. Whole-scope responses crossed the
-// engine's 16 MiB frame limit and dropped the worker, so list endpoints
-// page by default and refuse a page that would still be too large.
-function listPage<T>(
-  all: T[],
-  req: HttpRequest,
-  key: string,
-): Response {
-  const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
-  const rawOffset = parseOptionalInt(req.query_params?.["offset"]);
-  const limit =
-    rawLimit === undefined || rawLimit < 1
-      ? LIST_PAGE_DEFAULT
-      : Math.min(rawLimit, LIST_PAGE_MAX);
-  const offset = rawOffset === undefined || rawOffset < 0 ? 0 : rawOffset;
-  const body = {
-    [key]: all.slice(offset, offset + limit),
-    total: all.length,
-    limit,
-    offset,
-  };
+// One page of a scope, in the shared list protocol: `limit` and `cursor` in,
+// `{ [key]: page, total, nextCursor }` out. Unlike the list endpoints that
+// return everything when no limit or cursor is given, these always page:
+// a whole-scope response crossed the engine's 16 MiB frame limit and
+// dropped the worker. A page that would still be too large fails as 413.
+function listPage<T>(all: T[], req: HttpRequest, key: string): Response {
+  const listQuery = parseListQuery(req.query_params);
+  const paged = pageByOffset(all, listQuery.cursor, listQuery.limit ?? LIST_PAGE_DEFAULT);
+  const body = { [key]: paged.page, total: all.length, nextCursor: paged.nextCursor };
   const oversized = checkPayloadFrameSize(body, "request a smaller ?limit");
   if (oversized) return { status_code: 413, body: oversized };
   return { status_code: 200, body };

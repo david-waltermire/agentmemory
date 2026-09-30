@@ -69,44 +69,53 @@ const CASES = [
 
 for (const c of CASES) {
   describe(`${c.fn} pagination`, () => {
-    it("returns a default page of 50 plus the total", async () => {
+    it("returns a default page of 50 plus the total and a cursor", async () => {
       const sdk = await setup(c.scope, 120);
       const r = await call(sdk, c.fn);
       expect(r.status_code).toBe(200);
       expect((r.body[c.key] as unknown[]).length).toBe(50);
-      expect(r.body).toMatchObject({ total: 120, limit: 50, offset: 0 });
+      expect(r.body.total).toBe(120);
+      expect(typeof r.body.nextCursor).toBe("string");
     });
 
-    it("honors limit and offset", async () => {
-      const sdk = await setup(c.scope, 20);
-      const r = await call(sdk, c.fn, { limit: "5", offset: "10" });
-      expect((r.body[c.key] as Array<{ id: string }>).map((x) => x.id)).toEqual(
-        ["id_10", "id_11", "id_12", "id_13", "id_14"],
-      );
-      expect(r.body).toMatchObject({ total: 20, limit: 5, offset: 10 });
+    it("walks every record by following nextCursor", async () => {
+      const sdk = await setup(c.scope, 12);
+      const seen: string[] = [];
+      let cursor: string | null = null;
+      for (let i = 0; i < 10; i++) {
+        const q: Record<string, string> = { limit: "5" };
+        if (cursor) q.cursor = cursor;
+        const r = await call(sdk, c.fn, q);
+        seen.push(...(r.body[c.key] as Array<{ id: string }>).map((x) => x.id));
+        cursor = r.body.nextCursor as string | null;
+        if (!cursor) break;
+      }
+      expect(seen).toEqual(Array.from({ length: 12 }, (_, i) => `id_${i}`));
     });
 
-    it("caps limit at 500 and floors bad values to the defaults", async () => {
+    it("caps limit at 500", async () => {
       const sdk = await setup(c.scope, 600);
-      expect((await call(sdk, c.fn, { limit: "100000" })).body).toMatchObject({
-        limit: 500,
-      });
-      expect((await call(sdk, c.fn, { limit: "0" })).body).toMatchObject({
-        limit: 50,
-      });
-      expect((await call(sdk, c.fn, { limit: "abc" })).body).toMatchObject({
-        limit: 50,
-      });
-      expect((await call(sdk, c.fn, { offset: "-3" })).body).toMatchObject({
-        offset: 0,
-      });
+      const r = await call(sdk, c.fn, { limit: "100000" });
+      expect((r.body[c.key] as unknown[]).length).toBe(500);
     });
 
-    it("an offset past the end returns an empty page and the total", async () => {
+    it("falls back to the default page for a limit that is not a number", async () => {
+      // parseInt would read "5abc" as 5; the shared list-query parser rejects it.
+      const sdk = await setup(c.scope, 60);
+      for (const limit of ["5abc", "abc", "0", "-3", ""]) {
+        const r = await call(sdk, c.fn, { limit });
+        expect(
+          (r.body[c.key] as unknown[]).length,
+          `limit=${JSON.stringify(limit)}`,
+        ).toBe(50);
+      }
+    });
+
+    it("the last page has no nextCursor", async () => {
       const sdk = await setup(c.scope, 3);
-      const r = await call(sdk, c.fn, { offset: "10" });
-      expect(r.body[c.key]).toEqual([]);
-      expect(r.body).toMatchObject({ total: 3 });
+      const r = await call(sdk, c.fn, { limit: "5" });
+      expect((r.body[c.key] as unknown[]).length).toBe(3);
+      expect(r.body.nextCursor).toBeNull();
     });
 
     it("refuses a page over the frame limit with 413 instead of sending it", async () => {
