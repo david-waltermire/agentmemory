@@ -71,11 +71,13 @@ function parseOptionalInt(raw: unknown): number | undefined {
 // Default page for list endpoints whose scope can outgrow the frame limit.
 const LIST_PAGE_DEFAULT = 50;
 
-// One page of a scope, in the shared list protocol: `limit` and `cursor` in,
-// `{ [key]: page, total, nextCursor }` out. Unlike the list endpoints that
-// return everything when no limit or cursor is given, these always page:
-// a whole-scope response crossed the engine's 16 MiB frame limit and
-// dropped the worker. A page that would still be too large fails as 413.
+/**
+ * One page of a scope, in the shared list protocol: `limit` and `cursor` in,
+ * `{ [key]: page, total, nextCursor }` out. Unlike the list endpoints that
+ * return everything when no limit or cursor is given, these always page:
+ * a whole-scope response crossed the engine's 16 MiB frame limit and
+ * dropped the worker. A page that would still be too large fails as 413.
+ */
 function listPage<T>(all: T[], req: HttpRequest, key: string): Response {
   const listQuery = parseListQuery(req.query_params);
   const paged = pageByOffset(all, listQuery.cursor, listQuery.limit ?? LIST_PAGE_DEFAULT);

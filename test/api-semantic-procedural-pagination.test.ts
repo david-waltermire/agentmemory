@@ -14,6 +14,7 @@ import { SAFE_PAYLOAD_BYTES } from "../src/state/frame-guard.js";
 // the worker (every route 404s) on each 30 s viewer dashboard poll. Both
 // now return one page plus the total, and refuse an oversized page as 413.
 
+/** In-memory StateKV: one Map per scope; get, update and delete are no-ops. */
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
@@ -30,6 +31,7 @@ function mockKV() {
   };
 }
 
+/** SDK stub that records registered functions so a handler can be called directly. */
 function mockSdk() {
   const fns = new Map<string, Function>();
   return {
@@ -43,6 +45,7 @@ function mockSdk() {
 
 type Res = { status_code: number; body: Record<string, unknown> };
 
+/** Seeds `n` records of `bytesEach` bytes into `scope` and registers the API handlers. */
 async function setup(scope: string, n: number, bytesEach = 20) {
   const kv = mockKV();
   for (let i = 0; i < n; i++) {
@@ -56,6 +59,7 @@ async function setup(scope: string, n: number, bytesEach = 20) {
   return sdk;
 }
 
+/** Invokes a registered handler with the given query parameters. */
 const call = (
   sdk: ReturnType<typeof mockSdk>,
   fn: string,
