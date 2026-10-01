@@ -10,12 +10,6 @@ import {
 } from "../src/functions/graph.js";
 import type { GraphEdge, GraphNode } from "../src/types.js";
 
-// Each merge used to union every observation id in the batch into every
-// node and edge it touched, with no bound. On one store that made 98% of
-// the graph's bytes provenance ids (426 per node on average), and every
-// traversal carried them.
-
-/** In-memory StateKV: one Map per scope. */
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
@@ -37,7 +31,6 @@ function mockKV() {
 }
 
 let seq = 0;
-/** A concept node with the given name and sources. */
 function node(name: string, sources: string[]): GraphNode {
   seq += 1;
   return {
@@ -50,7 +43,6 @@ function node(name: string, sources: string[]): GraphNode {
   };
 }
 
-/** A related_to edge between two node ids with the given sources. */
 function edge(src: string, tgt: string, sources: string[]): GraphEdge {
   seq += 1;
   return {
@@ -64,11 +56,9 @@ function edge(src: string, tgt: string, sources: string[]): GraphEdge {
   };
 }
 
-/** `n` distinct observation ids with a prefix. */
 const ids = (prefix: string, n: number) =>
   Array.from({ length: n }, (_, i) => `${prefix}_${i}`);
 
-/** The single stored node with this name; fails if there is not exactly one. */
 async function onlyNode(kv: ReturnType<typeof mockKV>, name: string) {
   const all = await kv.list<GraphNode>("mem:graph:nodes");
   const hits = all.filter((n) => n.name === name);
@@ -76,7 +66,6 @@ async function onlyNode(kv: ReturnType<typeof mockKV>, name: string) {
   return hits[0]!;
 }
 
-/** The single stored edge; fails if there is not exactly one. */
 async function onlyEdge(kv: ReturnType<typeof mockKV>) {
   const all = await kv.list<GraphEdge>("mem:graph:edges");
   expect(all.length).toBe(1);
@@ -152,7 +141,6 @@ describe("graph provenance is bounded and attributed", () => {
   it("a merged node gains ITS OWN sources, not every id in the batch", async () => {
     const kv = mockKV();
     await persistGraphDelta(kv as never, [node("a.ts", ["obs_1"])], []);
-    // A batch of obs_2..obs_4 in which only obs_3 mentioned a.ts.
     await persistGraphDelta(
       kv as never,
       [node("a.ts", ["obs_3"]), node("b.ts", ["obs_2", "obs_4"])],
@@ -168,7 +156,6 @@ describe("graph provenance is bounded and attributed", () => {
     const b = node("b", ["obs_0"]);
     await persistGraphDelta(kv as never, [a, b], [edge(a.id, b.id, ["obs_0"])]);
     for (let batch = 1; batch <= 10; batch++) {
-      // A batch of ten observations; only the first one links a and b.
       const batchIds = ids(`obs_b${batch}`, 10);
       const a2 = node("a", batchIds);
       const b2 = node("b", batchIds);
@@ -225,7 +212,6 @@ describe("graph provenance is bounded and attributed", () => {
 });
 
 describe("temporal graph provenance is bounded", () => {
-  /** SDK stub that records registered functions so they can be triggered directly. */
   function mockSdk() {
     const functions = new Map<string, Function>();
     return {

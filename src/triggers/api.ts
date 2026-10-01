@@ -2027,14 +2027,10 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/reset", http_method: "POST" },
   });
 
-  // Trims graph provenance written before the per-record cap, walking the
-  // small name and edge-key indexes instead of listing the graph.
   sdk.registerFunction("api::graph-compact",
     async (req: HttpRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      // Validate here: mem::graph-compact reports bad input as success:false,
-      // which would reach the caller as HTTP 200. JSON numbers only.
       const body = (req.body ?? {}) as Record<string, unknown>;
       const { scope, offset, limit } = body;
       if (scope !== undefined && scope !== "nodes" && scope !== "edges" && scope !== "snapshot") {
@@ -2051,15 +2047,11 @@ export function registerApiTriggers(
           function_id: "mem::graph-compact",
           payload: { scope, offset, limit },
         });
-        // Input was validated above, so success:false here is an operational
-        // failure (mem::graph-compact logs the detail). Do not answer 200.
         if ((result as { success?: boolean } | null)?.success === false) {
           return { status_code: 500, body: { error: "Graph compaction failed" } };
         }
         return { status_code: 200, body: result };
       } catch (err) {
-        // Compaction is registered whether or not graph extraction is on, so
-        // a failure here is never the graph-disabled case.
         if (err instanceof InvocationError && err.code === "TIMEOUT") {
           return {
             status_code: 504,

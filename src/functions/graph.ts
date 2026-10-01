@@ -301,17 +301,8 @@ function snapshotPushEdgeIfBothInTop(
   }
 }
 
-// Provenance is bounded. Every merge used to union the whole batch's
-// observation ids into every node and edge it touched, which grew hot
-// nodes without limit: on one store 98% of the graph's bytes were these
-// ids, and every kv.list traversal carried them. Retrieval reads at most
-// 20 results, so a record never needs more than its newest sources.
 export const MAX_GRAPH_SOURCE_OBSERVATIONS = 32;
 
-/**
- * Union in arrival order, with a re-seen id moved to the newest end, then
- * keep the newest MAX_GRAPH_SOURCE_OBSERVATIONS.
- */
 export function boundSources(existing: string[], incoming: string[]): string[] {
   const merged = new Set(existing);
   for (const id of incoming) {
@@ -321,7 +312,6 @@ export function boundSources(existing: string[], incoming: string[]): string[] {
   return [...merged].slice(-MAX_GRAPH_SOURCE_OBSERVATIONS);
 }
 
-/** Merges an extracted node into the stored one: bounded own sources, newer properties. */
 function mergeNode(
   existing: GraphNode,
   incoming: GraphNode,
@@ -338,7 +328,6 @@ function mergeNode(
   };
 }
 
-/** Merges an extracted edge into the stored one, keeping its bounded own sources. */
 function mergeEdge(existing: GraphEdge, incoming: GraphEdge): GraphEdge {
   return {
     ...existing,
@@ -733,8 +722,6 @@ export interface GraphCompactResult {
   edgesTrimmed: number;
   idsRemoved: number;
   snapshotTrimmed: boolean;
-  // Records in the sliced index, and where the next slice starts; null
-  // when this call reached the end. A full run always ends with null.
   total?: number;
   nextOffset: number | null;
 }
@@ -749,19 +736,6 @@ export interface GraphCompactOptions {
 
 const COMPACT_SCOPES: readonly GraphCompactScope[] = ["nodes", "edges", "snapshot"];
 
-/**
- * Trims provenance written before the cap existed. Records are reached
- * through the name and edge-key indexes, whose values are short ids, and
- * then read and written one key at a time. The nodes and edges scopes are
- * never listed: that payload is what drops the worker on a large store.
- * A record missing from both indexes is not reached; it is also never
- * merged again, so it cannot grow.
- *
- * With no options it does everything in one call. With a scope it does one
- * slice, so each invocation stays short enough to finish between worker
- * reconnects; the caller walks nextOffset until it is null. Re-running any
- * slice is safe because trimmed records are skipped.
- */
 export async function compactGraphProvenance(
   kv: StateKV,
   opts: GraphCompactOptions = {},
@@ -789,7 +763,6 @@ export async function compactGraphProvenance(
     nextOffset: null,
   };
 
-  /** Trims one slice of records reached through an index scope, one locked key at a time. */
   const trimScope = async <R extends { sourceObservationIds: string[] }>(
     indexScope: string,
     recordScope: string,
@@ -818,7 +791,6 @@ export async function compactGraphProvenance(
     return { scanned, trimmed };
   };
 
-  /** Trims the cached snapshot's top nodes and edges under the same lock. */
   const trimSnapshot = () =>
     withKeyedLock("graph:persist", async () => {
       const snap = await readSnapshot(kv);
@@ -857,10 +829,6 @@ export async function compactGraphProvenance(
   return result;
 }
 
-/**
- * Registers the knowledge-graph functions: mem::graph-extract, mem::graph-query,
- * mem::graph-stats, mem::graph-compact and mem::graph-reset.
- */
 export function registerGraphFunction(
   sdk: IIIClient,
   kv: StateKV,

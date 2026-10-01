@@ -151,10 +151,6 @@ function parseTemporalGraphXml(
   return { nodes, edges };
 }
 
-/**
- * Registers the temporal-graph functions: mem::temporal-graph-extract,
- * mem::temporal-query and mem::differential-state.
- */
 export function registerTemporalGraphFunctions(
   sdk: IIIClient,
   kv: StateKV,
