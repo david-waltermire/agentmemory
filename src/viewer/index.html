@@ -2299,13 +2299,15 @@
     }
 
     // Walks nextCursor so a scope larger than one page still loads in full.
-    // Any failed page fails the whole load: a partial list would look complete.
+    // A failed page or a repeated cursor fails the whole load: a partial list
+    // would look complete.
     async function fetchAllPages(spec) {
       var result = await apiGet(spec.path);
       if (result === null) return null;
       var rows = listOr([], result, spec.key, spec.fallbackKey).slice();
       var seen = {};
-      while (result.nextCursor && !seen[result.nextCursor]) {
+      while (result.nextCursor) {
+        if (seen[result.nextCursor]) return null;
         seen[result.nextCursor] = true;
         result = await apiGet(spec.path + '&cursor=' + encodeURIComponent(result.nextCursor));
         if (result === null) return null;

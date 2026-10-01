@@ -168,6 +168,7 @@ describe("viewer loads every page of semantic and procedural", () => {
   /** Builds the viewer's fetchAllPages over a stubbed apiGet. */
   function load(pages: Record<string, Page>) {
     const calls: string[] = [];
+    /** Records the path and returns its canned page, or null like a failed request. */
     const apiGet = async (path: string) => {
       calls.push(path);
       return path in pages ? pages[path] : null;
@@ -238,7 +239,7 @@ describe("viewer loads every page of semantic and procedural", () => {
     expect(await fetchAllPages(spec)).toBeNull();
   });
 
-  it("stops when the server repeats a cursor", async () => {
+  it("fails the load, after two requests, when the server repeats a cursor", async () => {
     const { calls, fetchAllPages } = load({
       "semantic?limit=2": { semantic: [{ id: "a" }], nextCursor: "c1" },
       "semantic?limit=2&cursor=c1": {
@@ -246,7 +247,7 @@ describe("viewer loads every page of semantic and procedural", () => {
         nextCursor: "c1",
       },
     });
-    expect(await fetchAllPages(spec)).toEqual([{ id: "a" }, { id: "b" }]);
+    expect(await fetchAllPages(spec)).toBeNull();
     expect(calls).toHaveLength(2);
   });
 

@@ -472,6 +472,7 @@ function statusViewerUrl(req: HttpRequest, viewerPort: number | null): string {
   return "/agentmemory/viewer#health";
 }
 
+/** Registers the REST API handlers and the HTTP triggers that expose them under /agentmemory. */
 export function registerApiTriggers(
   sdk: IIIClient,
   kv: StateKV,
