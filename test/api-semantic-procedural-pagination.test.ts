@@ -129,7 +129,8 @@ for (const c of CASES) {
       expect(r.status_code).toBe(413);
       expect(r.body).toMatchObject({ oversized: true });
       expect(JSON.stringify(r.body).length).toBeLessThan(10_000);
-    });
+      // The page must exceed the 16 MiB frame, so this test is slow on a loaded runner.
+    }, 30_000);
   });
 }
 
@@ -140,5 +141,125 @@ describe("viewer asks for a page, not the whole scope", () => {
     expect(html).toMatch(/procedural: \{ path: 'procedural\?limit=\d+'/);
     expect(html).not.toMatch(/path: 'semantic'/);
     expect(html).not.toMatch(/path: 'procedural'/);
+  });
+});
+
+describe("viewer loads every page of semantic and procedural", () => {
+  const html = readFileSync("src/viewer/index.html", "utf-8");
+
+  /** Returns the source of one viewer function, by brace matching. */
+  function extractFunction(name: string): string {
+    const start = html.indexOf(`function ${name}(`);
+    if (start < 0) throw new Error(`function ${name} not found in viewer`);
+    let depth = 0;
+    for (let i = html.indexOf("{", start); i < html.length; i++) {
+      if (html[i] === "{") depth++;
+      if (html[i] === "}") {
+        depth--;
+        if (depth === 0) return html.slice(start, i + 1);
+      }
+    }
+    throw new Error(`function ${name} is not balanced`);
+  }
+
+  type Spec = { path: string; key: string; fallbackKey?: string };
+  type Page = Record<string, unknown> | null;
+
+  /** Builds the viewer's fetchAllPages over a stubbed apiGet. */
+  function load(pages: Record<string, Page>) {
+    const calls: string[] = [];
+    const apiGet = async (path: string) => {
+      calls.push(path);
+      return path in pages ? pages[path] : null;
+    };
+    const fetchAllPages = new Function(
+      "apiGet",
+      `${extractFunction("listOr")}\nasync ${extractFunction(
+        "fetchAllPages",
+      )}\nreturn fetchAllPages;`,
+    )(apiGet) as (spec: Spec) => Promise<unknown[] | null>;
+    return { calls, fetchAllPages };
+  }
+
+  const spec: Spec = {
+    path: "semantic?limit=2",
+    key: "facts",
+    fallbackKey: "semantic",
+  };
+
+  it("follows nextCursor until the last page", async () => {
+    const { calls, fetchAllPages } = load({
+      "semantic?limit=2": {
+        semantic: [{ id: "a" }, { id: "b" }],
+        nextCursor: "c1",
+      },
+      "semantic?limit=2&cursor=c1": {
+        semantic: [{ id: "c" }, { id: "d" }],
+        nextCursor: "c2",
+      },
+      "semantic?limit=2&cursor=c2": { semantic: [{ id: "e" }] },
+    });
+    expect(await fetchAllPages(spec)).toEqual([
+      { id: "a" },
+      { id: "b" },
+      { id: "c" },
+      { id: "d" },
+      { id: "e" },
+    ]);
+    expect(calls).toHaveLength(3);
+  });
+
+  it("makes one request when the first page is the last", async () => {
+    const { calls, fetchAllPages } = load({
+      "semantic?limit=2": { semantic: [{ id: "a" }] },
+    });
+    expect(await fetchAllPages(spec)).toEqual([{ id: "a" }]);
+    expect(calls).toEqual(["semantic?limit=2"]);
+  });
+
+  it("encodes the cursor into the query string", async () => {
+    const { calls, fetchAllPages } = load({
+      "semantic?limit=2": { semantic: [], nextCursor: "a+b/c=" },
+      "semantic?limit=2&cursor=a%2Bb%2Fc%3D": { semantic: [{ id: "x" }] },
+    });
+    expect(await fetchAllPages(spec)).toEqual([{ id: "x" }]);
+    expect(calls[1]).toBe("semantic?limit=2&cursor=a%2Bb%2Fc%3D");
+  });
+
+  it("returns null when the first page fails", async () => {
+    const { fetchAllPages } = load({});
+    expect(await fetchAllPages(spec)).toBeNull();
+  });
+
+  it("returns null, not a partial list, when a later page fails", async () => {
+    const { fetchAllPages } = load({
+      "semantic?limit=2": { semantic: [{ id: "a" }], nextCursor: "c1" },
+    });
+    expect(await fetchAllPages(spec)).toBeNull();
+  });
+
+  it("stops when the server repeats a cursor", async () => {
+    const { calls, fetchAllPages } = load({
+      "semantic?limit=2": { semantic: [{ id: "a" }], nextCursor: "c1" },
+      "semantic?limit=2&cursor=c1": {
+        semantic: [{ id: "b" }],
+        nextCursor: "c1",
+      },
+    });
+    expect(await fetchAllPages(spec)).toEqual([{ id: "a" }, { id: "b" }]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("is used for semantic and procedural only", () => {
+    expect(html).toMatch(
+      /semantic: \{ path: 'semantic\?limit=\d+', key: 'facts', fallbackKey: 'semantic', allPages: true \}/,
+    );
+    expect(html).toMatch(
+      /procedural: \{ path: 'procedural\?limit=\d+', key: 'procedures', fallbackKey: 'procedural', allPages: true \}/,
+    );
+    expect(html.match(/allPages: true/g)).toHaveLength(2);
+    expect(extractFunction("ensureLoaded")).toMatch(
+      /spec\.allPages[\s\S]*fetchAllPages\(spec\)/,
+    );
   });
 });
