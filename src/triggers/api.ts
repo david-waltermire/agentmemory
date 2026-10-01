@@ -86,7 +86,9 @@ function listPage<T extends { id: string; createdAt: string }>(
   key: string,
 ): Response {
   const listQuery = parseListQuery(req.query_params);
+  /** Primary sort key: when the row was created. */
   const createdAtOf = (row: T) => row.createdAt;
+  /** Tie-break for rows created at the same instant. */
   const idOf = (row: T) => row.id;
   const paged = pageAfterCursor(
     sortByKeyDesc(all, createdAtOf, idOf),
