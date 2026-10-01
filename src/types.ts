@@ -655,6 +655,7 @@ export interface AuditEntry {
     | "slot_create"
     | "slot_delete"
     | "slot_reflect"
+    | "graph_compact"
     | "audit_migrate";
   userId?: string;
   functionId: string;

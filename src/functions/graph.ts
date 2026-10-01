@@ -15,7 +15,7 @@ import {
   buildGraphExtractionPrompt,
 } from "../prompts/graph-extraction.js";
 import { isGraphExtractionEnabled } from "../config.js";
-import { recordAudit } from "./audit.js";
+import { recordAudit, safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
@@ -767,9 +767,9 @@ export async function compactGraphProvenance(
     indexScope: string,
     recordScope: string,
   ): Promise<{ scanned: number; trimmed: number }> => {
-    const allIds = [...new Set(await kv.list<string>(indexScope))].filter(
-      (id): id is string => typeof id === "string",
-    );
+    const allIds = [...new Set(await kv.list<string>(indexScope))]
+      .filter((id): id is string => typeof id === "string")
+      .sort();
     const end = Math.min(allIds.length, offset + limit);
     result.total = allIds.length;
     result.nextOffset = end < allIds.length ? end : null;
@@ -1254,6 +1254,31 @@ export function registerGraphFunction(
     }
   });
 
+  sdk.registerFunction("mem::graph-compact", async (data?: GraphCompactOptions) => {
+    const started = Date.now();
+    try {
+      const result = await compactGraphProvenance(kv, data ?? {});
+      const tookMs = Date.now() - started;
+      logger.info("Graph provenance compacted", { ...result, tookMs });
+      if (result.idsRemoved > 0) {
+        await safeAudit(kv, "graph_compact", "mem::graph-compact", [], {
+          scope: data?.scope ?? "all",
+          offset: data?.offset,
+          limit: data?.limit,
+          nodesTrimmed: result.nodesTrimmed,
+          edgesTrimmed: result.edgesTrimmed,
+          idsRemoved: result.idsRemoved,
+          snapshotTrimmed: result.snapshotTrimmed,
+        });
+      }
+      return { success: true, ...result, tookMs };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error("Graph provenance compaction failed", { error: msg });
+      return { success: false, error: msg };
+    }
+  });
+
   // #814 v2 + #825: clean-restart escape hatch for corpora of any
   // size, including the legacy 75K+ case that crashes kv.list.
   //
@@ -1275,20 +1300,6 @@ export function registerGraphFunction(
   // read by any post-#816 code path. Cleanup is deferred to a future
   // chunked-vacuum job; #816's broken vacuum-via-list strategy is
   // what we are leaving behind here.
-  sdk.registerFunction("mem::graph-compact", async (data?: GraphCompactOptions) => {
-    const started = Date.now();
-    try {
-      const result = await compactGraphProvenance(kv, data ?? {});
-      const tookMs = Date.now() - started;
-      logger.info("Graph provenance compacted", { ...result, tookMs });
-      return { success: true, ...result, tookMs };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.error("Graph provenance compaction failed", { error: msg });
-      return { success: false, error: msg };
-    }
-  });
-
   sdk.registerFunction("mem::graph-reset", async () => {
     const started = Date.now();
     // Stamp resetAt=now on the empty snapshot. Future

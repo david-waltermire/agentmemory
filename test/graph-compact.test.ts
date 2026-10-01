@@ -460,6 +460,107 @@ describe("chunked compaction", () => {
   });
 });
 
+function shuffledListKV() {
+  const kv = mockKV();
+  let seed = 7;
+  const rand = () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed / 2147483648;
+  };
+  const list = kv.list;
+  return {
+    ...kv,
+    list: async <T>(scope: string): Promise<T[]> => {
+      const items = await list<T>(scope);
+      for (let i = items.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1));
+        [items[i], items[j]] = [items[j], items[i]];
+      }
+      return items;
+    },
+  };
+}
+
+function registerCompact(kv: KV) {
+  const functions = new Map<string, Function>();
+  const sdk = {
+    registerFunction: (idOrOpts: string | { id: string }, handler: Function) =>
+      functions.set(typeof idOrOpts === "string" ? idOrOpts : idOrOpts.id, handler),
+    registerTrigger: () => {},
+  };
+  registerGraphFunction(
+    sdk as never,
+    kv as never,
+    { name: "noop", compress: vi.fn(), summarize: vi.fn() } as never,
+  );
+  return functions.get("mem::graph-compact")!;
+}
+
+describe("compaction with an unstable list order", () => {
+  it("a full sliced walk leaves no node or edge over the cap", async () => {
+    const kv = shuffledListKV();
+    const nid = (i: number) => `gn_${String(i).padStart(2, "0")}`;
+    for (let i = 0; i < 40; i++) await seedNode(kv, nid(i), `n${i}`, ids(`obs${i}`, 50));
+    for (let i = 0; i < 39; i++)
+      await seedEdge(kv, `ge_${String(i).padStart(2, "0")}`, nid(i), nid(i + 1), ids(`eobs${i}`, 50));
+    for (const scope of ["nodes", "edges"] as const) {
+      let offset: number | null = 0;
+      let calls = 0;
+      while (offset !== null && calls < 100) {
+        const r = await compactGraphProvenance(kv as never, { scope, offset, limit: 3 });
+        offset = r.nextOffset;
+        calls += 1;
+      }
+      expect(offset).toBeNull();
+    }
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    expect(nodes).toHaveLength(40);
+    expect(edges).toHaveLength(39);
+    const over = (r: { sourceObservationIds: string[] }) =>
+      r.sourceObservationIds.length > MAX_GRAPH_SOURCE_OBSERVATIONS;
+    expect(nodes.filter(over)).toEqual([]);
+    expect(edges.filter(over)).toEqual([]);
+  });
+});
+
+describe("mem::graph-compact audit", () => {
+  const auditEntries = async (kv: KV) => {
+    const scopes = [...new Set(kv.calls.set.map((k) => k.slice(0, k.lastIndexOf("/"))))].filter(
+      (s) => /^mem:audit:\d{4}-\d{2}$/.test(s),
+    );
+    const rows = await Promise.all(
+      scopes.map((s) =>
+        kv.list<{ operation: string; functionId: string; details: Record<string, unknown> }>(s),
+      ),
+    );
+    return rows.flat();
+  };
+
+  it("records an audit entry with the counts when ids are removed", async () => {
+    const kv = mockKV();
+    await seedNode(kv, "gn_1", "hub", ids("obs", 50));
+    await seedEdge(kv, "ge_1", "gn_1", "gn_2", ids("eobs", 40));
+    const r = await registerCompact(kv)({});
+    expect(r).toMatchObject({ success: true, idsRemoved: 26 });
+    const entries = await auditEntries(kv);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      operation: "graph_compact",
+      functionId: "mem::graph-compact",
+      details: { scope: "all", nodesTrimmed: 1, edgesTrimmed: 1, idsRemoved: 26 },
+    });
+  });
+
+  it("records nothing when there is nothing to trim", async () => {
+    const kv = mockKV();
+    await seedNode(kv, "gn_1", "hub", ids("obs", 5));
+    const r = await registerCompact(kv)({});
+    expect(r).toMatchObject({ success: true, idsRemoved: 0 });
+    expect(await auditEntries(kv)).toEqual([]);
+  });
+});
+
 describe("api::graph-compact responses", () => {
   async function route(
     trigger: (req: {
