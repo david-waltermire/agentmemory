@@ -836,6 +836,10 @@ export async function compactGraphProvenance(
   return result;
 }
 
+/**
+ * Registers the knowledge-graph functions: mem::graph-extract, mem::graph-query,
+ * mem::graph-stats, mem::graph-compact and mem::graph-reset.
+ */
 export function registerGraphFunction(
   sdk: IIIClient,
   kv: StateKV,
