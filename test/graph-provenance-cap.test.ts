@@ -292,4 +292,54 @@ describe("temporal graph provenance is bounded", () => {
       all.slice(-MAX_GRAPH_SOURCE_OBSERVATIONS),
     );
   });
+
+  it("a temporal edge from a batch larger than the cap keeps only the newest ids", async () => {
+    const { registerTemporalGraphFunctions } = await import(
+      "../src/functions/temporal-graph.js"
+    );
+    const response = `<temporal_graph>
+  <entities>
+    <entity type="person" name="Alice"></entity>
+    <entity type="project" name="Acme"></entity>
+  </entities>
+  <relationships>
+    <relationship type="works_on" source="Alice" target="Acme" weight="0.9"></relationship>
+  </relationships>
+</temporal_graph>`;
+    const provider = {
+      name: "test",
+      compress: vi.fn().mockResolvedValue(response),
+      summarize: vi.fn().mockResolvedValue(response),
+    };
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerTemporalGraphFunctions(
+      sdk as never,
+      kv as never,
+      provider as never,
+    );
+
+    const batch = ids("obs_e", MAX_GRAPH_SOURCE_OBSERVATIONS + 8);
+    for (let round = 0; round < 2; round++) {
+      const r = (await sdk.trigger("mem::temporal-graph-extract", {
+        observations: batch.map((id) => ({
+          id,
+          title: "t",
+          narrative: "Alice works on Acme",
+          concepts: [],
+          files: [],
+          type: "conversation",
+          timestamp: "2026-09-24T00:00:00Z",
+        })),
+      })) as { success: boolean };
+      expect(r.success).toBe(true);
+    }
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    expect(edges).toHaveLength(2);
+    for (const e of edges) {
+      expect(e.sourceObservationIds).toEqual(
+        batch.slice(-MAX_GRAPH_SOURCE_OBSERVATIONS),
+      );
+    }
+  });
 });

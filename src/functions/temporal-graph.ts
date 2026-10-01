@@ -259,6 +259,7 @@ export function registerTemporalGraphFunctions(
               edge.version = (existingEdge.version || 1) + 1;
             }
 
+            edge.sourceObservationIds = boundSources([], edge.sourceObservationIds ?? []);
             await kv.set(KV.graphEdges, edge.id, edge);
             existingEdges.push(edge);
           }
