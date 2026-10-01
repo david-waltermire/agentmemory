@@ -14,7 +14,7 @@ import { SAFE_PAYLOAD_BYTES } from "../src/state/frame-guard.js";
 // the worker (every route 404s) on each 30 s viewer dashboard poll. Both
 // now return one page plus the total, and refuse an oversized page as 413.
 
-/** In-memory StateKV: one Map per scope; get, update and delete are no-ops. */
+/** In-memory StateKV: one Map per scope; get and update are no-ops. */
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
@@ -24,7 +24,9 @@ function mockKV() {
       store.get(s)!.set(k, d);
       return d;
     },
-    delete: async () => {},
+    delete: async (s: string, k: string) => {
+      store.get(s)?.delete(k);
+    },
     update: async () => {},
     list: async <T>(scope: string): Promise<T[]> =>
       Array.from(store.get(scope)?.values() ?? []) as T[],
@@ -45,18 +47,32 @@ function mockSdk() {
 
 type Res = { status_code: number; body: Record<string, unknown> };
 
+/** Record `i` was created `i` minutes after a fixed epoch, so a higher `i` is newer. */
+const createdAt = (i: number) =>
+  new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString();
+
+/** Ids from newest to oldest for `n` seeded records. */
+const newestFirst = (n: number) =>
+  Array.from({ length: n }, (_, i) => `id_${n - 1 - i}`);
+
 /** Seeds `n` records of `bytesEach` bytes into `scope` and registers the API handlers. */
-async function setup(scope: string, n: number, bytesEach = 20) {
+async function setupWithKV(scope: string, n: number, bytesEach = 20) {
   const kv = mockKV();
   for (let i = 0; i < n; i++) {
     await kv.set(scope, `id_${i}`, {
       id: `id_${i}`,
+      createdAt: createdAt(i),
       fact: "f".repeat(bytesEach),
     });
   }
   const sdk = mockSdk();
   registerApiTriggers(sdk as never, kv as never);
-  return sdk;
+  return { sdk, kv };
+}
+
+/** Same as setupWithKV, for tests that do not touch the store afterwards. */
+async function setup(scope: string, n: number, bytesEach = 20) {
+  return (await setupWithKV(scope, n, bytesEach)).sdk;
 }
 
 /** Invokes a registered handler with the given query parameters. */
@@ -94,7 +110,41 @@ for (const c of CASES) {
         cursor = r.body.nextCursor as string | null;
         if (!cursor) break;
       }
-      expect(seen).toEqual(Array.from({ length: 12 }, (_, i) => `id_${i}`));
+      expect(seen).toEqual(newestFirst(12));
+    });
+
+    it("skips no record when a row before the cursor is deleted mid-walk", async () => {
+      const { sdk, kv } = await setupWithKV(c.scope, 12);
+      const first = await call(sdk, c.fn, { limit: "5" });
+      const firstIds = (first.body[c.key] as Array<{ id: string }>).map(
+        (x) => x.id,
+      );
+      await kv.delete(c.scope, firstIds[0]);
+      const seen = [...firstIds];
+      let cursor = first.body.nextCursor as string | null;
+      while (cursor) {
+        const r = await call(sdk, c.fn, { limit: "5", cursor });
+        seen.push(...(r.body[c.key] as Array<{ id: string }>).map((x) => x.id));
+        cursor = r.body.nextCursor as string | null;
+      }
+      expect(seen).toEqual(newestFirst(12));
+    });
+
+    it("orders by id when two records share a createdAt", async () => {
+      const { sdk, kv } = await setupWithKV(c.scope, 0);
+      for (const id of ["b", "a", "c"]) {
+        await kv.set(c.scope, id, { id, createdAt: createdAt(0), fact: "f" });
+      }
+      const seen: string[] = [];
+      let cursor: string | null = null;
+      do {
+        const q: Record<string, string> = { limit: "1" };
+        if (cursor) q.cursor = cursor;
+        const r = await call(sdk, c.fn, q);
+        seen.push(...(r.body[c.key] as Array<{ id: string }>).map((x) => x.id));
+        cursor = r.body.nextCursor as string | null;
+      } while (cursor);
+      expect(seen).toEqual(["c", "b", "a"]);
     });
 
     it("caps limit at 500", async () => {
@@ -262,5 +312,98 @@ describe("viewer loads every page of semantic and procedural", () => {
     expect(extractFunction("ensureLoaded")).toMatch(
       /spec\.allPages[\s\S]*fetchAllPages\(spec\)/,
     );
+  });
+});
+
+describe("viewer retries an all-pages load that loses its replay range", () => {
+  const html = readFileSync("src/viewer/index.html", "utf-8");
+
+  /** Returns the source of one viewer function, by brace matching. */
+  function extractFunction(name: string): string {
+    const start = html.indexOf(`function ${name}(`);
+    if (start < 0) throw new Error(`function ${name} not found in viewer`);
+    let depth = 0;
+    for (let i = html.indexOf("{", start); i < html.length; i++) {
+      if (html[i] === "{") depth++;
+      if (html[i] === "}") {
+        depth--;
+        if (depth === 0) return html.slice(start, i + 1);
+      }
+    }
+    throw new Error(`function ${name} is not balanced`);
+  }
+
+  type Harness = {
+    ensureLoaded: (kind: string) => Promise<void>;
+    store: { loaded: Record<string, boolean> };
+    replaced: unknown[][];
+    attempts: () => number;
+  };
+
+  /**
+   * Runs the viewer's ensureLoaded with stubbed globals. `evictOn(attempt)`
+   * says whether that load attempt sees more live events than the log holds.
+   */
+  function harness(evictOn: (attempt: number) => boolean): Harness {
+    const build = new Function(
+      "evictOn",
+      `
+      var EVENT_LOG_MAX = 500;
+      ${html.match(/var ALL_PAGES_ATTEMPTS = \d+;/)![0]}
+      var eventLog = [];
+      var eventSeq = 0;
+      var store = { loaded: {}, loading: {}, entities: {} };
+      var bootGate = Promise.resolve();
+      var ENTITY_ENDPOINTS = {
+        semantic: { path: 'semantic?limit=2', key: 'facts', fallbackKey: 'semantic', allPages: true }
+      };
+      var replaced = [];
+      var attempts = 0;
+      function replaceBucket(kind, rows) { replaced.push(rows); }
+      function replayEventsSince() {}
+      function liveEvent() {
+        eventLog.push({ seq: ++eventSeq });
+        if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
+      }
+      liveEvent();
+      async function apiGet(path) {
+        attempts++;
+        var n = evictOn(attempts) ? EVENT_LOG_MAX + 1 : 1;
+        for (var i = 0; i < n; i++) liveEvent();
+        return { semantic: [{ id: 'a' }] };
+      }
+      ${extractFunction("listOr")}
+      ${extractFunction("replayRangeIntact")}
+      async ${extractFunction("fetchAllPages")}
+      async ${extractFunction("ensureLoaded")}
+      return { ensureLoaded: ensureLoaded, store: store, replaced: replaced,
+               attempts: function() { return attempts; } };
+      `,
+    );
+    return build(evictOn) as Harness;
+  }
+
+  it("loads on the first attempt when no event is evicted", async () => {
+    const h = harness(() => false);
+    await h.ensureLoaded("semantic");
+    expect(h.store.loaded.semantic).toBe(true);
+    expect(h.replaced).toHaveLength(1);
+    expect(h.attempts()).toBe(1);
+  });
+
+  it("retries when the first attempt loses its replay range", async () => {
+    const h = harness((attempt) => attempt === 1);
+    await h.ensureLoaded("semantic");
+    expect(h.store.loaded.semantic).toBe(true);
+    expect(h.replaced).toHaveLength(1);
+    expect(h.attempts()).toBe(2);
+  });
+
+  it("stays unloaded, without committing, after a bounded number of lost ranges", async () => {
+    const h = harness(() => true);
+    await h.ensureLoaded("semantic");
+    expect(h.store.loaded.semantic).toBeFalsy();
+    expect(h.replaced).toHaveLength(0);
+    expect(h.attempts()).toBe(3);
   });
 });

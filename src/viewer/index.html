@@ -1733,6 +1733,7 @@
     }
     var FEED_MAX = 40;
     var EVENT_LOG_MAX = 500;
+    var ALL_PAGES_ATTEMPTS = 3;
     var eventLog = [];
     var eventSeq = 0;
 
@@ -2340,6 +2341,11 @@
       store.entities[kind] = bucket;
     }
 
+    // True when the event log still holds every event after seq.
+    function replayRangeIntact(seq) {
+      return eventLog.length === 0 || eventLog[0].seq <= seq + 1;
+    }
+
     async function ensureLoaded(kind) {
       if (store.loaded[kind]) return;
       if (store.loading[kind]) return store.loading[kind];
@@ -2350,11 +2356,18 @@
           await bootGate;
           var seqAtStart = eventSeq;
           if (spec.allPages) {
-            var all = await fetchAllPages(spec);
-            if (all === null) return;
-            replaceBucket(kind, all);
-            replayEventsSince(seqAtStart, kind);
-            store.loaded[kind] = true;
+            // A long load can outlast the event log. Committing then would drop
+            // the evicted events, so retry, and stay unloaded if every try loses them.
+            for (var attempt = 0; attempt < ALL_PAGES_ATTEMPTS; attempt++) {
+              seqAtStart = eventSeq;
+              var all = await fetchAllPages(spec);
+              if (all === null) return;
+              if (!replayRangeIntact(seqAtStart)) continue;
+              replaceBucket(kind, all);
+              replayEventsSince(seqAtStart, kind);
+              store.loaded[kind] = true;
+              return;
+            }
             return;
           }
           var result = await apiGet(spec.path);

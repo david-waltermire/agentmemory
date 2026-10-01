@@ -77,10 +77,24 @@ const LIST_PAGE_DEFAULT = 50;
  * return everything when no limit or cursor is given, these always page:
  * a whole-scope response crossed the engine's 16 MiB frame limit and
  * dropped the worker. A page that would still be too large fails as 413.
+ * Pages run newest first and resume after the last row's (createdAt, id),
+ * so a row deleted before the cursor cannot shift a later row past it.
  */
-function listPage<T>(all: T[], req: HttpRequest, key: string): Response {
+function listPage<T extends { id: string; createdAt: string }>(
+  all: T[],
+  req: HttpRequest,
+  key: string,
+): Response {
   const listQuery = parseListQuery(req.query_params);
-  const paged = pageByOffset(all, listQuery.cursor, listQuery.limit ?? LIST_PAGE_DEFAULT);
+  const createdAtOf = (row: T) => row.createdAt;
+  const idOf = (row: T) => row.id;
+  const paged = pageAfterCursor(
+    sortByKeyDesc(all, createdAtOf, idOf),
+    createdAtOf,
+    idOf,
+    listQuery.cursor,
+    listQuery.limit ?? LIST_PAGE_DEFAULT,
+  );
   const body = { [key]: paged.page, total: all.length, nextCursor: paged.nextCursor };
   const oversized = checkPayloadFrameSize(body, "request a smaller ?limit");
   if (oversized) return { status_code: 413, body: oversized };
