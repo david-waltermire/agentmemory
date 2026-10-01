@@ -20,6 +20,7 @@ import type { GraphEdge, GraphNode } from "../src/types.js";
 // value is captured. That forces the interleaving that loses a merge when
 // writers are not serialized: compaction reads, a merge writes, then
 // compaction writes back its stale copy.
+/** In-memory StateKV that records list and set calls; can delay the first node read to force a race. */
 function mockKV(slowFirstNodeReadMs = 0) {
   const store = new Map<string, Map<string, unknown>>();
   const calls = { list: [] as string[], set: [] as string[] };
@@ -57,9 +58,11 @@ function mockKV(slowFirstNodeReadMs = 0) {
 }
 type KV = ReturnType<typeof mockKV>;
 
+/** `n` distinct observation ids with a prefix. */
 const ids = (prefix: string, n: number) =>
   Array.from({ length: n }, (_, i) => `${prefix}_${i}`);
 
+/** Stores a node and its name-index entry. */
 async function seedNode(kv: KV, id: string, name: string, sources: string[]) {
   const n: GraphNode = {
     id,
@@ -75,6 +78,7 @@ async function seedNode(kv: KV, id: string, name: string, sources: string[]) {
   return n;
 }
 
+/** Stores an edge and its edge-key entry. */
 async function seedEdge(
   kv: KV,
   id: string,
@@ -96,7 +100,9 @@ async function seedEdge(
   return e;
 }
 
+/** Reads a stored node by id. */
 const node = (kv: KV, id: string) => kv.get<GraphNode>("mem:graph:nodes", id);
+/** Reads a stored edge by id. */
 const edge = (kv: KV, id: string) => kv.get<GraphEdge>("mem:graph:edges", id);
 
 describe("compactGraphProvenance", () => {
@@ -469,6 +475,7 @@ describe("chunked compaction", () => {
 });
 
 describe("api::graph-compact responses", () => {
+  /** Registers the API handlers with a stub trigger and returns a caller for api::graph-compact. */
   async function route(
     trigger: (req: {
       function_id: string;

@@ -15,6 +15,7 @@ import type { GraphEdge, GraphNode } from "../src/types.js";
 // the graph's bytes provenance ids (426 per node on average), and every
 // traversal carried them.
 
+/** In-memory StateKV: one Map per scope. */
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
@@ -36,6 +37,7 @@ function mockKV() {
 }
 
 let seq = 0;
+/** A concept node with the given name and sources. */
 function node(name: string, sources: string[]): GraphNode {
   seq += 1;
   return {
@@ -48,6 +50,7 @@ function node(name: string, sources: string[]): GraphNode {
   };
 }
 
+/** A related_to edge between two node ids with the given sources. */
 function edge(src: string, tgt: string, sources: string[]): GraphEdge {
   seq += 1;
   return {
@@ -61,9 +64,11 @@ function edge(src: string, tgt: string, sources: string[]): GraphEdge {
   };
 }
 
+/** `n` distinct observation ids with a prefix. */
 const ids = (prefix: string, n: number) =>
   Array.from({ length: n }, (_, i) => `${prefix}_${i}`);
 
+/** The single stored node with this name; fails if there is not exactly one. */
 async function onlyNode(kv: ReturnType<typeof mockKV>, name: string) {
   const all = await kv.list<GraphNode>("mem:graph:nodes");
   const hits = all.filter((n) => n.name === name);
@@ -71,6 +76,7 @@ async function onlyNode(kv: ReturnType<typeof mockKV>, name: string) {
   return hits[0]!;
 }
 
+/** The single stored edge; fails if there is not exactly one. */
 async function onlyEdge(kv: ReturnType<typeof mockKV>) {
   const all = await kv.list<GraphEdge>("mem:graph:edges");
   expect(all.length).toBe(1);
@@ -219,6 +225,7 @@ describe("graph provenance is bounded and attributed", () => {
 });
 
 describe("temporal graph provenance is bounded", () => {
+  /** SDK stub that records registered functions so they can be triggered directly. */
   function mockSdk() {
     const functions = new Map<string, Function>();
     return {
