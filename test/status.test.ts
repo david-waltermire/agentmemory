@@ -50,6 +50,14 @@ function codes(report: ReturnType<typeof evaluateStatus>): string[] {
 }
 
 describe("evaluateStatus", () => {
+  it("holds the missing-observations warning while the keyword index rebuilds", () => {
+    const report = evaluateStatus(
+      inputs({ index: { ...inputs().index, missingObservations: 7, keywordRebuildRunning: true } }),
+    );
+    expect(codes(report)).not.toContain("index-missing-observations");
+    expect(codes(report)).toContain("keyword-index-rebuilding");
+  });
+
   it("reports ok with no problems on a healthy install", () => {
     const report = evaluateStatus(inputs());
     expect(report.status).toBe("ok");
@@ -127,6 +135,28 @@ describe("evaluateStatus", () => {
     expect(report.status).toBe("warn");
     const problem = report.problems.find((p) => p.code === "index-vector-count-shortfall");
     expect(problem?.message).toContain("40 of 100 vectors");
+  });
+
+  it("reports absent and partial vector recovery as paused until explicitly opted in", () => {
+    const report = evaluateStatus(inputs({
+      index: { ...inputs().index, pendingVectorBackfill: 60, vectorBackfillState: "waiting-for-opt-in" },
+      indexPersistence: { saveIntervalMs: 600_000, saving: false, buckets: 3, pendingChanges: 0, vector: null, vectorCountShortfall: { expected: 100, loaded: 40 } },
+    }));
+    for (const problem of report.problems) {
+      expect(problem.fix).toContain("Backfill is paused.");
+      expect(problem.fix).toContain("AGENTMEMORY_VECTOR_BACKFILL=all");
+      expect(problem.fix).not.toContain("running in the background");
+      expect(problem.message).not.toContain("re-embeds the rest");
+    }
+    expect(report.index.vectorBackfillState).toBe("waiting-for-opt-in");
+    expect(renderStatusHtml(report, "n")).toContain("paused, waiting for opt-in");
+  });
+
+  it("only describes vector recovery as running when the worker reports an active backfill", () => {
+    const active = evaluateStatus(inputs({ index: { ...inputs().index, pendingVectorBackfill: 42, vectorBackfillState: "running" } }));
+    expect(active.problems[0].fix).toContain("Backfill is running in the background");
+    const idle = evaluateStatus(inputs({ index: { ...inputs().index, pendingVectorBackfill: 42, vectorBackfillState: "idle" } }));
+    expect(idle.problems[0].fix).toContain("Backfill is not running");
   });
 
   it("checks snapshot presence when extraction is on, and snapshot age whenever a snapshot exists", () => {

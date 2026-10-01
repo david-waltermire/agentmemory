@@ -55,6 +55,8 @@ import {
   type ConnectManifest,
   type RemoveOptions,
 } from "./cli/remove-plan.js";
+import { portFlagSuffix } from "./cli/ready-hint.js";
+import { describeInstallFailure, iiiInstallShellCommand, iiiManualInstallCommand, III_INSTALL_SPAWN_TIMEOUT_MS } from "./cli/engine-install.js";
 import {
   dockerComposeArgs,
   dockerProjectName,
@@ -71,6 +73,8 @@ import { runtimeMetadataPath } from "./runtime-paths.js";
 import { createStartupStderrCapture } from "./cli/startup-stderr.js";
 import {
   clearPersistedBuiltinConfig,
+  engineFlushWaitMs,
+  persistedBuiltinConfigDirs,
   renderEngineConfig,
 } from "./cli/engine-config.js";
 import { SHUTDOWN_HARD_EXIT_MS } from "./shutdown.js";
@@ -1326,21 +1330,25 @@ async function runIiiInstaller(): Promise<{ ok: boolean; binPath: string | null 
 
   const binDir = agentmemoryBinDir();
   const binPath = privateIiiPath();
-  const installCmd = [
-    `mkdir -p "${binDir}"`,
-    `curl -fsSL "${releaseUrl}" | tar -xz -C "${binDir}"`,
-    `chmod +x "${binPath}"`,
-  ].join(" && ");
-  const installerOk = runCommand(shBin, ["-c", installCmd], {
-    label: `Installing iii-engine v${IIPINNED_VERSION} (pinned)`,
-    optional: true,
-  });
-  if (!installerOk) {
+  const label = `Installing iii-engine v${IIPINNED_VERSION} (pinned)`;
+  const spinner = p.spinner();
+  spinner.start(label);
+  const result = spawnSync(
+    shBin,
+    ["-c", iiiInstallShellCommand(releaseUrl, binDir, binPath)],
+    { stdio: "pipe", encoding: "utf-8", timeout: III_INSTALL_SPAWN_TIMEOUT_MS },
+  );
+  if (result.status !== 0) {
+    spinner.stop(`${label} ${pc.red("✗")}`);
     p.log.warn(
-      `iii-engine installer failed. Fallbacks: Docker (\`docker pull iiidev/iii:${IIPINNED_VERSION}\`) or download manually from https://github.com/iii-hq/iii/releases/tag/iii%2Fv${IIPINNED_VERSION}.`,
+      `iii-engine download failed: ${describeInstallFailure(result).slice(0, 300)}\n` +
+        `Install it manually, then re-run agentmemory:\n` +
+        `  ${iiiManualInstallCommand(releaseUrl, binDir, binPath)}\n` +
+        `Or use Docker: docker pull iiidev/iii:${IIPINNED_VERSION}`,
     );
     return { ok: false, binPath: null };
   }
+  spinner.stop(`${label} ${pc.green("✓")}`);
   return { ok: true, binPath };
 }
 
@@ -1906,8 +1914,9 @@ function printReadyHint(): void {
   const engineUrl = `ws://${engineHost}:${getEnginePort()}`;
   const invocation = isInvokedViaNpx() ? "npx @agentmemory/agentmemory" : "agentmemory";
   const consolePort = defaultConsolePort(getConfiguredViewerPort());
+  const portFlags = portFlagSuffix(getRestPort(), selectedInstance);
 
-  const consoleLine = `${c.label("iii console")}  ${c.cmd(`${invocation} console`)}  ${c.dim(`(serves on :${consolePort}; first run downloads the console next to the pinned iii)`)}`;
+  const consoleLine = `${c.label("iii console")}  ${c.cmd(`${invocation} console${portFlags}`)}  ${c.dim(`(serves on :${consolePort}; first run downloads the console next to the pinned iii)`)}`;
 
   const lines = [
     `${c.label("REST API")}     ${c.url(restUrl)}`,
@@ -1926,7 +1935,7 @@ function printReadyHint(): void {
   // (unless they accepted the global-install prompt and the npm bin
   // dir was already on PATH in this shell), so we suggest the npx
   // form for them; everyone else gets the global form.
-  const demoCommand = `${invocation} demo`;
+  const demoCommand = `${invocation} demo${portFlags}`;
   process.stdout.write(`\n${c.dim("Try:")} ${c.cmd(demoCommand)}\n`);
 }
 
@@ -3269,6 +3278,29 @@ async function signalAndWait(
 // Shared worker-reap: SIGTERM with a grace window sized for the worker's
 // shutdown flush (index snapshots land via the engine, so the worker must
 // die before the engine does, with time to commit).
+async function waitForEngineFlush(): Promise<void> {
+  let stateBackend: "file" | "redis" = "file";
+  try {
+    stateBackend = getStateBackend();
+  } catch {}
+  const runtimePath = runtimeConfigPath(dataDirResolution.dataDir);
+  const configTexts: string[] = [];
+  for (const path of [
+    ...persistedBuiltinConfigDirs(join(homedir(), ".agentmemory"), runtimePath).map((dir) => join(dir, "iii-state.yaml")),
+    runtimePath,
+  ]) {
+    try {
+      configTexts.push(readFileSync(path, "utf-8"));
+    } catch {}
+  }
+  const waitMs = engineFlushWaitMs(stateBackend, configTexts);
+  if (waitMs <= 0) return;
+  const s = p.spinner();
+  s.start(`Waiting ${(waitMs / 1000).toFixed(1)}s for iii-engine to write state to disk...`);
+  await new Promise((r) => setTimeout(r, waitMs));
+  s.stop("iii-engine state flush window passed");
+}
+
 async function stopWorkerPid(pid: number, graceMs: number): Promise<boolean> {
   const s = p.spinner();
   s.start(`Stopping agentmemory worker (pid ${pid})... [flushing state]`);
@@ -3585,7 +3617,10 @@ async function runStop(): Promise<void> {
   // persists. Worker SIGTERM grace bumped 3s -> 5s to give a large
   // index a real chance to commit before the engine goes away.
   for (const pid of workerCandidates) {
-    if (!(await stopWorkerPid(pid, 5000))) allStopped = false;
+    if (!(await stopWorkerPid(pid, SHUTDOWN_HARD_EXIT_MS + 1000))) allStopped = false;
+  }
+  if (workerCandidates.size > 0 && [...candidates].some((pid) => !workerCandidates.has(pid))) {
+    await waitForEngineFlush();
   }
   const skippedForeign: Array<{ pid: number; comm: string }> = [];
   for (const pid of candidates) {

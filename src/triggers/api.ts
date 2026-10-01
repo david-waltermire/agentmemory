@@ -16,9 +16,12 @@ import { CONSOLIDATION_COUNTS_REUSE_MS, CONSOLIDATION_LAST_RUN_KEY, PROCEDURAL_M
 import { UNINDEXED_SCAN_REUSE_MS, evaluateStatus, prefersHtml, renderStatusHtml, singleFlight, type GraphStatsInput, type StatusReport } from "../functions/status.js";
 import {
   findUnindexedObservations,
+  getKeywordRebuildEpoch,
+  isKeywordRebuildInProgress,
   getIndexPersistenceStatus,
   getEmbeddingProvider,
   getPendingVectorBackfillCount,
+  getVectorBackfillState,
   getSearchIndex,
   getVectorIndex,
   isBm25RebuildIncomplete,
@@ -41,6 +44,7 @@ import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
 import { describeGraphNode } from "../functions/graph-node.js";
 import { LESSON_SOURCE_IDS_MAX, normalizeLessonSourceIds } from "../functions/lessons.js";
 import { logger } from "../logger.js";
+import { withoutObservationSource } from "../functions/observation-source.js";
 import {
   isGraphExtractionEnabled,
   isConsolidationEnabled,
@@ -302,12 +306,14 @@ async function probeStateStore(kv: StateKV): Promise<{ ok: boolean; latencyMs?: 
 }
 
 type UnindexedScan = Awaited<ReturnType<typeof findUnindexedObservations>>;
-const unindexedScans = new WeakMap<StateKV, { run: () => Promise<UnindexedScan>; last: { at: number; value: UnindexedScan } | null }>();
+type UnindexedScanEntry = { epoch: number; run: () => Promise<UnindexedScan>; last: { at: number; value: UnindexedScan } | null };
+const unindexedScans = new WeakMap<StateKV, UnindexedScanEntry>();
 
 function unindexedScanFor(kv: StateKV) {
   let entry = unindexedScans.get(kv);
-  if (!entry) {
-    const created: { run: () => Promise<UnindexedScan>; last: { at: number; value: UnindexedScan } | null } = {
+  if (!entry || entry.epoch !== getKeywordRebuildEpoch()) {
+    const created: UnindexedScanEntry = {
+      epoch: getKeywordRebuildEpoch(),
       run: singleFlight(async () => {
         const value = await findUnindexedObservations(kv);
         created.last = { at: Date.now(), value };
@@ -327,9 +333,10 @@ export interface StatusReporterDeps {
 }
 
 export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusReporterDeps) {
-  const scan = unindexedScanFor(kv);
   return async function statusReport(options: { health?: HealthSnapshot | null; scanMaxAgeMs?: number } = {}): Promise<StatusReport> {
     const idx = getSearchIndex();
+    const keywordRebuildRunning = isKeywordRebuildInProgress();
+    const scan = unindexedScanFor(kv);
     const cached = scan.last && options.scanMaxAgeMs !== undefined && Date.now() - scan.last.at < options.scanMaxAgeMs
       ? scan.last.value
       : null;
@@ -340,7 +347,7 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
         sdk.trigger({ function_id: "mem::graph-stats", payload: {} }) as Promise<GraphStatsInput>,
         STATUS_CHECK_TIMEOUT_MS,
       ),
-      cached ? Promise.resolve(cached) : valueWithin(scan.run(), STATUS_CHECK_TIMEOUT_MS),
+      keywordRebuildRunning ? Promise.resolve(null) : cached ? Promise.resolve(cached) : valueWithin(scan.run(), STATUS_CHECK_TIMEOUT_MS),
       valueWithin(
         kv.get<AuditMigrationState>(KV.auditMonths, AUDIT_MIGRATION_STATE_KEY),
         STATUS_CHECK_TIMEOUT_MS,
@@ -353,6 +360,7 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
       deps.provider && "circuitState" in deps.provider
         ? (deps.provider.circuitState as { state?: string; failures?: number } | null)
         : null;
+    const config = loadConfig();
     return evaluateStatus({
       now: new Date(),
       version: VERSION,
@@ -360,8 +368,8 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
       uptimeSeconds: Math.round(process.uptime()),
       stateBackend: kv.backend === "redis" ? "redis" : "file",
       ports: {
-        rest: loadConfig().restPort ?? null,
-        streams: loadConfig().streamsPort ?? null,
+        rest: config.restPort ?? null,
+        streams: config.streamsPort ?? null,
         viewer: getViewerSkipped() ? null : (getBoundViewerPort() ?? null),
       },
       health: health
@@ -389,7 +397,9 @@ export function createStatusReporter(sdk: IIIClient, kv: StateKV, deps: StatusRe
         missingObservations: unindexed ? unindexed.missing.length : null,
         sessions: unindexed ? unindexed.sessions : null,
         bm25Incomplete: isBm25RebuildIncomplete(),
+        keywordRebuildRunning,
         pendingVectorBackfill: getPendingVectorBackfillCount(),
+        vectorBackfillState: getVectorBackfillState(),
       },
       graph,
       graphExtractionEnabled: isGraphExtractionEnabled(),
@@ -1283,7 +1293,7 @@ export function registerApiTriggers(
         filtered = filtered.filter((o) => (o.importance ?? 0) >= minImportance);
       }
       if (listQuery.limit === undefined && !listQuery.cursor) {
-        return { status_code: 200, body: { observations: filtered, total: filtered.length, nextCursor: null } };
+        return { status_code: 200, body: { observations: filtered.map(withoutObservationSource), total: filtered.length, nextCursor: null } };
       }
       const total = filtered.length;
       const paged = pageAfterCursor(
@@ -1295,7 +1305,7 @@ export function registerApiTriggers(
       );
       return {
         status_code: 200,
-        body: { observations: paged.page, total, nextCursor: paged.nextCursor },
+        body: { observations: paged.page.map(withoutObservationSource), total, nextCursor: paged.nextCursor },
       };
     },
   );
@@ -2349,6 +2359,7 @@ export function registerApiTriggers(
         type?: string[];
         dateFrom?: string;
         dateTo?: string;
+        project?: string;
         qualityBelow?: number;
         dryRun?: boolean;
       }>,
