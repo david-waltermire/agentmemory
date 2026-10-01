@@ -312,8 +312,8 @@ export function boundSources(existing: string[], incoming: string[]): string[] {
   return [...merged].slice(-MAX_GRAPH_SOURCE_OBSERVATIONS);
 }
 
-export function boundRecordSources<R extends { sourceObservationIds?: unknown }>(record: R): R {
-  const sources = record?.sourceObservationIds;
+export function boundRecordSources<R extends object>(record: R): R {
+  const sources = (record as { sourceObservationIds?: unknown } | null)?.sourceObservationIds;
   if (!Array.isArray(sources) || sources.length <= MAX_GRAPH_SOURCE_OBSERVATIONS) return record;
   return { ...record, sourceObservationIds: boundSources([], sources as string[]) };
 }
